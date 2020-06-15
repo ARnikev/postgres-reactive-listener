@@ -1,0 +1,98 @@
+### 1 Using reconciliation job
+
+```
+  updateEntityMethod() {
+    transaction {
+       saveEntity()
+       saveEntityRelatedEvent(not_published)
+    }
+
+    publishEntityRelatedEvent()
+
+    markEntityRelatedEventAsPublished(published)
+
+    // if we failed to publish an event - it should be reconciled as soon as possible
+  }
+
+  // scheduled job or just worker background thread
+  reconciliationJob {
+    // pulls not published events from the db and publishes them to kinesis
+  }
+```
+
+pros:
+- failures on publishEntityRelatedEvent() call happens very rarely and if if they happen our reconciliation job will publish them reliably;
+
+cons:
+- reconciliation job is constantly pooling our db thereby creating unnecessary load and
+  consuming IOPS even when there are no records in which we are interested (at least for now this is not critical for us);
+- job runs once per 10 seconds and therefor sometimes we can have some delay in the reconciliation process (is it critical?);
+- has set of problems with possible concurrent modifications of the events records (can be avoided by using locks);
+- this solution doesn't fit if we need some events to be published in strict order.
+
+problems:
+- event can potentially be reconciled before published during sync execution;
+  - possible solutions:
+    * db record locking;
+    * just allow events to be published twice sometimes :)
+
+- (if we use immutable events and every time create new event record)
+  while we reconciling some old event some new event comes and being published during this sync flow,
+  but then we finally publish outdated old event during reconciliation job
+  - possible solutions:
+    * we can add some kind of ordering timestamp to an event object and let consumers of the event decide when to reject events that came out of logical order;
+    * mutable card_event_record
+
+      1) we set card_event_record id (actually it should be composite primary key - id + event_type) manually,
+         e.g. for flags it will be "cardId + flagType", for limits "cardId + limit type", for card activation "cardId";
+      2) we make this card_event_record mutable i.e. we are gonna update it on every change of the entity that is supposed to produce some particular event.
+         e.g. when flag with some particular type and for particular card has been updated -> we update the card_event_record with an id "cardId+flagType";
+      3) we also should use locking on that record so that reconciliationJob do not process the record which status has already been updated to synced=true.
+
+      downsides of this are:
+        1) we loose a real history of events, but maybe we don't need if we have audit records for each card_event_record/entity;
+        2) we loose an ordering of events;
+        3) we use more locking on DB level.
+
+    * card_event_records are still immutable, but we also add some kind of ordering id + timestamp (e.g. flag type + cardId) so that we can have some order
+      of event for the same entity and during reconciliationJob reconcile only the most recent event for the particular ordering id (if it's not synced yet).
+
+      downsides:
+        1) more complicated to implementation since in the reconciliationJob we have to obtain not only unsynced events, but all event with the same orderId
+           and check if the unsynced one is the last in the chaine of events with the same order id;
+        2) when we update event synced status we anyway have to use locking.
+
+### 2 Capturing postgresql data changes using NOTIFY/LISTEN + Triggers or WAL + logical replication
+
+```
+      updateEntityMethod() {
+        transaction {
+          saveEntity()
+          saveEntityRelatedEvent() // when event is saved - db notifies about us that
+        }
+      }
+
+
+      entityEventsReactiveListener() {
+          // listens a stream with new added to db entity related events and publishes them to kinesis
+      }
+```
+
+cons:
+- what if connection drops? // todo
+- if error happens, we retry several times and still fail -> we will loose the value // can be combined with reconciliation job, but what's the point then?
+- we need only one instance of our application to be able to listen for such events // @RunIfLeader should work here
+- during deployment we can have duplicated events being published // not sure how it work with that @RunIfLeader annotation
+
+pros:
+- we don't need to pull our database,  we publish events as soon as they saved to our database
+- less reconciliation logic
+- events are published in strict order in which they appear in the DB
+- less explicit db locking
+
+### 3 Publishing entity change to sqs queue -> consuming -> saving to the database + publishing to kinesis
+cons:
+-  does not fit for latency critical functional
+
+### 4 Use kafka postgres connector to stream db changes right to a kafka topic and then process them by publishing to Kinesis live stream (https://github.com/debezium/debezium)
+
