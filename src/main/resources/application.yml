@@ -1,0 +1,15 @@
+spring:
+  application:
+    name: reactive-listener
+  datasource:
+    url: jdbc:postgresql://localhost:5432/postgres
+    username: postgres
+    password: docker
+    driver-class-name: org.postgresql.Driver
+    hikari:
+      data-source-properties:
+        stringtype: unspecified
+  r2dbc:
+    url: r2dbc:postgres://localhost:5432/postgres
+    username: postgres
+    password: docker
